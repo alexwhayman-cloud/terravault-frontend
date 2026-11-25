@@ -279,7 +279,10 @@ jobs:
               # Also the repo root, as slash commands resolve `@file` from the project root rather than
               # the command file's folder. It only adds files to scan: a `..` that leaves the repo from
               # the root says nothing about where the file's own folder would take it.
-              extra_root = "" not in bases
+              # For a slash command the root is the real base, so its out-of-repo results count.
+              ps = parts(loc)
+              is_command = "commands" in ps and any(c in AGENT_DIRS for c in ps)
+              extra_root = "" not in bases and not is_command
               bases = bases | {""}
               text = open(real, encoding="utf-8", errors="replace").read()
               for strict, pattern in ((True, AT_START), (False, IN_WORD)):
