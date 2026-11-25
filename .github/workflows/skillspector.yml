@@ -1,0 +1,199 @@
+# Scans the files that instruct AI agents in this repo (CLAUDE.md and AGENTS.md at any depth,
+# .claude/, .mcp.json, skills) with NVIDIA SkillSpector before a change to them merges.
+# Why: an agent obeys these files with the repo's full trust, so a poisoned skill, hook or
+# instruction is a supply-chain attack on every session that opens the repo.
+#
+# Static analysis only (--no-llm): no file content is sent to any model provider.
+# Fails when the risk score is above 50 (SkillSpector's own threshold) or the scan errors.
+# The static patterns match words, not intent, so read a finding before acting on it. To
+# accept a reviewed finding, merge a baseline to the default branch first: run
+# `skillspector baseline <staged dir> -o .github/skillspector-baseline.json`, where the staged
+# dir holds the files at their repo-relative paths (the "Collect" step below builds one).
+# On a pull request the baseline is read from the base branch, never from the PR itself,
+# so a PR cannot mute its own findings.
+name: skillspector
+
+on:
+  pull_request:
+    paths:
+      - "**/CLAUDE.md"
+      - "**/AGENTS.md"
+      - ".mcp.json"
+      - ".claude/**"
+      - ".claude-plugin/**"
+      - ".cursor/rules/**"
+      - "**/SKILL.md"
+      - "**/skills/**"
+      - ".github/workflows/skillspector.yml"
+      - ".github/skillspector-baseline.json"
+  push:
+    branches: [main, master]
+    paths:
+      - "**/CLAUDE.md"
+      - "**/AGENTS.md"
+      - ".mcp.json"
+      - ".claude/**"
+      - ".claude-plugin/**"
+      - ".cursor/rules/**"
+      - "**/SKILL.md"
+      - "**/skills/**"
+      - ".github/workflows/skillspector.yml"
+      - ".github/skillspector-baseline.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skillspector-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: repo
+          persist-credentials: false
+
+      # The baseline comes from the base branch on a pull request (see the header).
+      - name: Check out base-branch baseline
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.base_ref }}
+          path: base
+          sparse-checkout: .github/skillspector-baseline.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Collect agent-facing files
+        id: stage
+        working-directory: repo
+        run: |
+          python3 -I - "$RUNNER_TEMP/agent-files" "$GITHUB_OUTPUT" "$RUNNER_TEMP/skipped.txt" <<'PY'
+          # Copies every tracked agent-facing file to the staging dir at its repo-relative path.
+          # NUL-separated git output, so no file name (quotes, spaces, non-ASCII) can break it.
+          import os, shutil, subprocess, sys
+          dest, out, skipped_path = sys.argv[1:4]
+          root = os.path.realpath(".")
+
+          def ls(*specs):
+              raw = subprocess.run(["git", "ls-files", "-z", "--", *specs],
+                                   check=True, capture_output=True).stdout
+              return [p for p in os.fsdecode(raw).split("\0") if p]
+
+          files = set(ls(*(":(glob)" + s for s in (
+              "**/CLAUDE.md", "**/AGENTS.md", ".mcp.json", "**/SKILL.md", "**/skills/**",
+              ".claude/**", ".claude-plugin/**", ".cursor/rules/**"))))
+          # A skill is its whole directory: scripts beside SKILL.md run with it.
+          for skill in [f for f in files if os.path.basename(f) == "SKILL.md"]:
+              d = os.path.dirname(skill)
+              if d:
+                  files.update(ls(":(literal)" + d))
+          files = sorted(f for f in files if "node_modules" not in f.split("/"))
+
+          copied, skipped = 0, []
+          for f in files:
+              real = os.path.realpath(f)
+              # A symlink is scanned as its target only when that target is a file inside
+              # the repo; anything else is not copied (it could pull runner files into
+              # the uploaded report) and is listed as not scanned.
+              if not real.startswith(root + os.sep) or not os.path.isfile(real):
+                  skipped.append(f)
+                  continue
+              target = os.path.join(dest, f)
+              os.makedirs(os.path.dirname(target), exist_ok=True)
+              shutil.copyfile(real, target)
+              copied += 1
+
+          with open(skipped_path, "w") as fh:
+              fh.writelines(s + "\n" for s in skipped)
+          with open(out, "a") as fh:
+              fh.write(f"count={copied}\ndir={dest}\n")
+          print(f"Agent-facing files: {copied} staged, {len(skipped)} not scanned")
+          PY
+
+      - name: Nothing to scan
+        if: steps.stage.outputs.count == '0'
+        run: echo "No agent-facing files in this repo; nothing to scan." >> "$GITHUB_STEP_SUMMARY"
+
+      # The scanner is pinned to a reviewed commit and installed from that commit's own
+      # uv.lock, so neither it nor its dependencies move between runs. Bump deliberately.
+      - name: Check out SkillSpector
+        if: steps.stage.outputs.count != '0'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NVIDIA/SkillSpector
+          ref: f9bb13dd1667eb4e7ac97b8ebace3160041ed571
+          path: skillspector
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        if: steps.stage.outputs.count != '0'
+
+      - name: Install SkillSpector
+        if: steps.stage.outputs.count != '0'
+        run: uv sync --project skillspector --frozen --no-dev --python 3.13
+
+      - name: Scan
+        if: steps.stage.outputs.count != '0'
+        env:
+          SCAN_DIR: ${{ steps.stage.outputs.dir }}
+          BASELINE: ${{ github.event_name == 'pull_request' && 'base/.github/skillspector-baseline.json' || 'repo/.github/skillspector-baseline.json' }}
+        run: |
+          set -uo pipefail
+          args=(scan "$SCAN_DIR" --no-llm --format json --output "$RUNNER_TEMP/skillspector.json")
+          if [ -f "$BASELINE" ]; then
+            args+=(--baseline "$BASELINE")
+          fi
+          # GitHub runs this step with `bash -e`; capture the exit code so the summary is
+          # still written when the scan fails, which is when it matters most.
+          code=0
+          uv run --project skillspector --frozen --no-dev --no-sync skillspector "${args[@]}" || code=$?
+          python3 -I - "$RUNNER_TEMP/skillspector.json" "$RUNNER_TEMP/skipped.txt" "$code" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys
+          path, skipped_path, code = sys.argv[1], sys.argv[2], sys.argv[3]
+          print("## SkillSpector")
+          print()
+          try:
+              d = json.load(open(path))
+          except Exception as exc:
+              print(f"No report was written (exit {code}: {exc}). See the job log.")
+              sys.exit(0)
+          r = d.get("risk_assessment") or {}
+          c = d.get("analysis_completeness") or {}
+          print(f"Risk score **{r.get('score')}** ({r.get('severity')}, {r.get('recommendation')}); "
+                f"coverage {c.get('coverage_percent')}%; exit {code}. The check fails above 50.")
+          print()
+          issues = d.get("issues") or []
+          if not issues:
+              print("No findings.")
+          else:
+              print("| Severity | Rule | File | Line | Match |")
+              print("|---|---|---|---|---|")
+              for i in issues:
+                  loc = i.get("location") or {}
+                  match = str(i.get("finding", ""))[:100].replace("|", "\\|").replace("\n", " ")
+                  print(f"| {i.get('severity')} | {i.get('id')} {i.get('pattern')} | "
+                        f"`{loc.get('file')}` | {loc.get('start_line')} | {match} |")
+          for x in c.get("ledger_exceptions") or []:
+              print(f"\nNot fully inspected: `{x.get('path')}` ({x.get('reason_code')}).")
+          skipped = [s for s in open(skipped_path).read().splitlines() if s]
+          if skipped:
+              print("\nNot scanned (symlink to outside the repo, or not a regular file):")
+              for s in skipped:
+                  print(f"- `{s}`")
+          PY
+          exit "$code"
+
+      - name: Upload report
+        if: always() && steps.stage.outputs.count != '0'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: skillspector-report
+          path: ${{ runner.temp }}/skillspector.json
+          if-no-files-found: ignore
+          retention-days: 14
