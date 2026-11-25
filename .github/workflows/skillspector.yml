@@ -1,12 +1,15 @@
-# Scans the files that instruct AI agents in this repo (CLAUDE.md and AGENTS.md at any depth,
-# .claude/, .mcp.json, skills and the files beside them) with NVIDIA SkillSpector before a
-# change to them merges.
+# Scans the files that instruct AI agents in this repo with NVIDIA SkillSpector before a change
+# to them merges: CLAUDE.md, CLAUDE.local.md, AGENTS.md and .mcp.json at any depth, every
+# .claude/, .claude-plugin/, skills/ and .cursor/rules/ directory (names matched in any case,
+# symlinked ones followed), each skill's whole directory, and the files CLAUDE.md-style files
+# pull in with @imports.
 # Why: an agent obeys these files with the repo's full trust, so a poisoned skill, hook or
 # instruction is a supply-chain attack on every session that opens the repo.
 #
 # Static analysis only (--no-llm): no file content is sent to any model provider.
 # Fails when the risk score is above 50 (SkillSpector's own threshold), when the scan errors,
-# or when an agent-facing file could not be scanned (a symlink out of the repo, say).
+# or when an agent-facing file could not be scanned (a symlink or @import out of the repo,
+# or a submodule).
 #
 # Pull requests run under pull_request_target, so the workflow that judges a PR is the one on
 # the base branch: a PR cannot weaken or remove its own check by editing this file. In
@@ -64,65 +67,120 @@ jobs:
         working-directory: repo
         run: |
           python3 -I - "$RUNNER_TEMP/agent-files" "$GITHUB_OUTPUT" "$RUNNER_TEMP/skipped.txt" <<'PY'
-          # Copies every tracked agent-facing file to the staging dir at its repo-relative path.
-          # NUL-separated git output, so no file name (quotes, spaces, non-ASCII) can break it.
-          import os, shutil, subprocess, sys
+          # Copies every agent-facing file of the repo in the working directory to the staging dir,
+          # at its repo-relative path. Works from the full tracked-file list (NUL-separated, with
+          # modes), so no file name can break it and nothing is matched by a pattern a PR can dodge.
+          import os, re, shutil, subprocess, sys
           dest, out, skipped_path = sys.argv[1:4]
           root = os.path.realpath(".")
 
-          def ls(*specs):
-              raw = subprocess.run(["git", "ls-files", "-z", "--", *specs],
-                                   check=True, capture_output=True).stdout
-              return [p for p in os.fsdecode(raw).split("\0") if p]
+          # Compared in lower case: macOS disks are case-insensitive, so `claude.md` or `.Claude/`
+          # load there just as `CLAUDE.md` and `.claude/` do.
+          AGENT_DIRS = {".claude", ".claude-plugin", "skills"}
+          AGENT_FILES = {"claude.md", "claude.local.md", "agents.md", ".mcp.json", "skill.md"}
+          IMPORTERS = {"claude.md", "claude.local.md", "agents.md"}
 
-          def inside(path):
-              return path.startswith(root + os.sep)
+          raw = subprocess.run(["git", "ls-files", "-s", "-z"], check=True, capture_output=True).stdout
+          modes = {}
+          for rec in os.fsdecode(raw).split("\0"):
+              if rec:
+                  meta, path = rec.split("\t", 1)
+                  modes[path] = meta.split()[0]
 
-          files = set(ls(*(":(glob)" + s for s in (
-              "**/CLAUDE.md", "**/AGENTS.md", ".mcp.json", "**/SKILL.md", "**/skills/**",
-              ".claude/**", ".claude-plugin/**", ".cursor/rules/**"))))
+          def parts(p):
+              return [c.lower() for c in p.split("/")]
+
+          def agent_facing(p):
+              ps = parts(p)
+              if ps[-1] in AGENT_FILES:
+                  return True
+              # A path inside an agent dir, or the dir entry itself when it is a symlink.
+              if any(c in AGENT_DIRS for c in ps):
+                  return True
+              return any(ps[i] == ".cursor" and ps[i + 1] == "rules" for i in range(len(ps) - 1))
+
+          selected = {p for p in modes if agent_facing(p)}
           # A skill is its whole directory: scripts beside SKILL.md run with it.
-          for skill in [f for f in files if os.path.basename(f) == "SKILL.md"]:
-              d = os.path.dirname(skill)
-              if d:
-                  files.update(ls(":(literal)" + d))
-          files = sorted(f for f in files if "node_modules" not in f.split("/"))
+          for p in list(modes):
+              d = os.path.dirname(p)
+              if parts(p)[-1] == "skill.md" and d:
+                  selected.update(q for q in modes if q.startswith(d + "/"))
 
-          copied, skipped = 0, []
+          skipped = []
 
-          def copy(src_real, staged):
-              global copied
-              target = os.path.join(dest, staged)
-              os.makedirs(os.path.dirname(target), exist_ok=True)
-              shutil.copyfile(src_real, target)
-              copied += 1
+          # CLAUDE.md-style files pull in other files with `@path` imports, recursively; the imported
+          # files reach the agent too, so they are scanned. Code spans and blocks are not imports.
+          FENCE = re.compile(r"```.*?```|~~~.*?~~~", re.S)
+          INLINE = re.compile(r"`[^`\n]*`")
+          IMPORT = re.compile(r"(?<![\w@`/])@([^\s`)\]>,;\"']+)")
+          queue = [(p, 0) for p in sorted(selected) if parts(p)[-1] in IMPORTERS]
+          done = set()
+          while queue:
+              p, depth = queue.pop()
+              real = os.path.realpath(p)
+              if p in done or depth > 5 or not os.path.isfile(real):
+                  continue
+              done.add(p)
+              text = open(real, encoding="utf-8", errors="replace").read()
+              text = INLINE.sub("", FENCE.sub("", text))
+              for m in IMPORT.finditer(text):
+                  ref = m.group(1)
+                  if ref.startswith("~"):
+                      continue  # the reader's home directory, not repo content
+                  for cand in (ref, ref.rstrip(".:")):
+                      target = os.path.normpath(cand if os.path.isabs(cand)
+                                                else os.path.join(os.path.dirname(p), cand))
+                      if os.path.isabs(target) or target.startswith(".."):
+                          # Leaves the repo: on a developer's machine it could load any file.
+                          skipped.append(f"{p} imports @{cand}, outside the repo")
+                          break
+                      if target in modes:
+                          selected.add(target)
+                          if target.lower().endswith(".md"):
+                              queue.append((target, depth + 1))
+                          break
 
-          for f in files:
-              real = os.path.realpath(f)
-              if inside(real) and os.path.isfile(real):
-                  # A regular file, or a symlink to one inside the repo: scan its content.
-                  copy(real, f)
-              elif inside(real) and os.path.isdir(real):
-                  # A symlink to a directory inside the repo: the agent reads every file
-                  # under it, so scan them all, at their paths under the link.
-                  for dirpath, _, names in os.walk(real):
-                      for name in names:
-                          sub = os.path.join(f, os.path.relpath(os.path.join(dirpath, name), real))
-                          sub_real = os.path.realpath(os.path.join(dirpath, name))
-                          if inside(sub_real) and os.path.isfile(sub_real):
-                              copy(sub_real, sub)
-                          else:
-                              skipped.append(sub)
+          staged = set()
+          visited = set()
+
+          def inside(real):
+              return (real == root or real.startswith(root + os.sep)) and \
+                  not (real + os.sep).startswith(os.path.join(root, ".git") + os.sep)
+
+          def stage(src, rel):
+              real = os.path.realpath(src)
+              if not inside(real):
+                  skipped.append(rel)
+              elif os.path.isfile(real):
+                  target = os.path.join(dest, rel)
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  shutil.copyfile(real, target)
+                  staged.add(rel)
+              elif os.path.isdir(real):
+                  # Every link below is followed through the same check, so a link out of the repo
+                  # anywhere under an agent dir is caught; `visited` stops link loops.
+                  if real in visited:
+                      return
+                  visited.add(real)
+                  for name in sorted(os.listdir(real)):
+                      if real == root and name == ".git":
+                          continue
+                      stage(os.path.join(real, name), f"{rel}/{name}")
               else:
-                  # Points out of the repo, dangles, or is not a file: never copied (it could
-                  # pull runner files into the uploaded report), and the check fails below.
-                  skipped.append(f)
+                  skipped.append(rel)
+
+          for p in sorted(selected):
+              if modes.get(p) == "160000":
+                  # A submodule checks out empty here but is fetched by anyone cloning recursively.
+                  skipped.append(f"{p} (submodule)")
+              else:
+                  stage(os.path.join(root, p), p)
 
           with open(skipped_path, "w") as fh:
               fh.writelines(s + "\n" for s in skipped)
           with open(out, "a") as fh:
-              fh.write(f"count={copied}\nskipped={len(skipped)}\ndir={dest}\n")
-          print(f"Agent-facing files: {copied} staged, {len(skipped)} could not be scanned")
+              fh.write(f"count={len(staged)}\nskipped={len(skipped)}\ndir={dest}\n")
+          print(f"Agent-facing files: {len(staged)} staged, {len(skipped)} could not be scanned")
           PY
 
       - name: Nothing to scan
@@ -144,6 +202,11 @@ jobs:
 
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         if: steps.stage.outputs.count != '0'
+        with:
+          # uv itself is pinned like everything else; no cache, so a PR's run never writes
+          # one into the base branch's cache scope.
+          version: "0.13.10"
+          enable-cache: false
 
       - name: Install SkillSpector
         if: steps.stage.outputs.count != '0'
@@ -167,7 +230,7 @@ jobs:
                       hashes.append(p["sdist"]["hash"])
                   fh.write(f"{n}=={p['version']} " + " ".join(f"--hash={h}" for h in hashes) + "\n")
           PY
-          uv venv skillspector/.venv --python 3.13
+          uv venv skillspector/.venv --python 3.13.18
           uv pip install --python skillspector/.venv --require-hashes -r "$RUNNER_TEMP/build-constraints.txt"
           uv sync --project skillspector --frozen --no-dev --inexact --no-editable \
             --no-build-isolation-package skillspector
