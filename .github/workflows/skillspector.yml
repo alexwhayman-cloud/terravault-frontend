@@ -71,7 +71,7 @@ jobs:
           # at its repo-relative path. Works from the full tracked-file list (NUL-separated, with
           # modes), so no file name can break it and nothing is matched by a pattern a PR can dodge.
           # Nothing that resolves outside the repo is ever opened.
-          import os, re, shutil, subprocess, sys, unicodedata
+          import collections, os, re, shutil, subprocess, sys, unicodedata
           dest, out, skipped_path = sys.argv[1:4]
           root = os.path.realpath(".")
 
@@ -238,9 +238,17 @@ jobs:
                   skipped.append(f"more than {MAX_ALIASES} paths to CLAUDE.md-style files through "
                                  "links; too many to check the imports from each")
                   break
+          else:
+              if grown:
+                  # Still growing after the last round: deeper link chains exist that were not
+                  # followed, so their imports are unknown.
+                  skipped.append("CLAUDE.md-style files are reachable through more than 4 chained "
+                                 "folder links; too deep to check the imports from each")
 
-          queue = [(p, 0) for p in sorted(walked_importers | aliases
-                                          | {p for p in selected if parts(p)[-1] in IMPORTERS})]
+          # Breadth-first, so every path is first read at its shallowest import depth: a file reached
+          # late through a long chain is not then skipped when a short chain reaches it.
+          queue = collections.deque((p, 0) for p in sorted(walked_importers | aliases
+                                                            | {p for p in selected if parts(p)[-1] in IMPORTERS}))
           done = set()
           locations = {}
           # Bounds the work, so imports chained through many links fail the check quickly and say so
@@ -248,7 +256,7 @@ jobs:
           MAX_READS, MAX_LOCATIONS = 2000, 16
           reads = 0
           while queue:
-              loc, depth = queue.pop()
+              loc, depth = queue.popleft()
               if reads >= MAX_READS:
                   skipped.append(f"more than {MAX_READS} import reads; the import graph is too large to check")
                   break
