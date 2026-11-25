@@ -1,51 +1,44 @@
-# Scans the files that instruct AI agents in this repo (CLAUDE.md and AGENTS.md at any depth,
-# .claude/, .mcp.json, skills) with NVIDIA SkillSpector before a change to them merges.
+# Scans the files that instruct AI agents in this repo with NVIDIA SkillSpector before a change
+# to them merges: CLAUDE.md, CLAUDE.local.md, AGENTS.md and .mcp.json at any depth, every
+# .claude/, .claude-plugin/, skills/ and .cursor/rules/ directory (names matched in any case,
+# symlinked ones followed), each skill's whole directory, and the files CLAUDE.md-style files
+# pull in with @imports.
 # Why: an agent obeys these files with the repo's full trust, so a poisoned skill, hook or
 # instruction is a supply-chain attack on every session that opens the repo.
 #
 # Static analysis only (--no-llm): no file content is sent to any model provider.
-# Fails when the risk score is above 50 (SkillSpector's own threshold) or the scan errors.
+# Fails when the risk score is above 50 (SkillSpector's own threshold), when the scan errors,
+# or when an agent-facing file could not be scanned (a symlink or @import out of the repo,
+# or a submodule).
+#
+# Pull requests run under pull_request_target, so the workflow that judges a PR is the one on
+# the base branch: a PR cannot weaken or remove its own check by editing this file. In
+# exchange, nothing from the PR is ever executed here: its files are only listed with git,
+# copied and read by the scanner. Keep it that way; never run, install or source anything
+# from repo/. Permissions stay read-only and no secret is used.
+#
 # The static patterns match words, not intent, so read a finding before acting on it. To
-# accept a reviewed finding, merge a baseline to the default branch first: run
-# `skillspector baseline <staged dir> -o .github/skillspector-baseline.json`, where the staged
-# dir holds the files at their repo-relative paths (the "Collect" step below builds one).
-# On a pull request the baseline is read from the base branch, never from the PR itself,
-# so a PR cannot mute its own findings.
+# accept a reviewed finding, merge a baseline to the default branch first: copy the
+# agent-facing files into a directory at their repo-relative paths (as the Collect step
+# below does) and run
+#   skillspector baseline <that dir> --no-llm -o .github/skillspector-baseline.json
+# On a pull request the baseline is read from the base branch, never from the PR.
 name: skillspector
 
 on:
-  pull_request:
-    paths:
-      - "**/CLAUDE.md"
-      - "**/AGENTS.md"
-      - ".mcp.json"
-      - ".claude/**"
-      - ".claude-plugin/**"
-      - ".cursor/rules/**"
-      - "**/SKILL.md"
-      - "**/skills/**"
-      - ".github/workflows/skillspector.yml"
-      - ".github/skillspector-baseline.json"
+  # No path filter: a skill's scripts can live anywhere, and a symlink can point an
+  # agent-facing path at any file, so every PR is checked. With no agent files it takes
+  # seconds.
+  pull_request_target:
   push:
     branches: [main, master]
-    paths:
-      - "**/CLAUDE.md"
-      - "**/AGENTS.md"
-      - ".mcp.json"
-      - ".claude/**"
-      - ".claude-plugin/**"
-      - ".cursor/rules/**"
-      - "**/SKILL.md"
-      - "**/skills/**"
-      - ".github/workflows/skillspector.yml"
-      - ".github/skillspector-baseline.json"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: skillspector-${{ github.ref }}
+  group: skillspector-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -55,12 +48,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: repo
           persist-credentials: false
 
-      # The baseline comes from the base branch on a pull request (see the header).
       - name: Check out base-branch baseline
-        if: github.event_name == 'pull_request'
+        if: github.event_name == 'pull_request_target'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.base_ref }}
@@ -74,54 +67,286 @@ jobs:
         working-directory: repo
         run: |
           python3 -I - "$RUNNER_TEMP/agent-files" "$GITHUB_OUTPUT" "$RUNNER_TEMP/skipped.txt" <<'PY'
-          # Copies every tracked agent-facing file to the staging dir at its repo-relative path.
-          # NUL-separated git output, so no file name (quotes, spaces, non-ASCII) can break it.
-          import os, shutil, subprocess, sys
+          # Copies every agent-facing file of the repo in the working directory to the staging dir,
+          # at its repo-relative path. Works from the full tracked-file list (NUL-separated, with
+          # modes), so no file name can break it and nothing is matched by a pattern a PR can dodge.
+          # Nothing that resolves outside the repo is ever opened.
+          import collections, os, re, shutil, subprocess, sys, unicodedata
           dest, out, skipped_path = sys.argv[1:4]
           root = os.path.realpath(".")
 
-          def ls(*specs):
-              raw = subprocess.run(["git", "ls-files", "-z", "--", *specs],
-                                   check=True, capture_output=True).stdout
-              return [p for p in os.fsdecode(raw).split("\0") if p]
+          # Compared in lower case: macOS disks are case-insensitive, so `claude.md` or `.Claude/`
+          # load there just as `CLAUDE.md` and `.claude/` do.
+          AGENT_DIRS = {".claude", ".claude-plugin", "skills"}
+          AGENT_FILES = {"claude.md", "claude.local.md", "agents.md", ".mcp.json", "skill.md"}
+          IMPORTERS = {"claude.md", "claude.local.md", "agents.md"}
 
-          files = set(ls(*(":(glob)" + s for s in (
-              "**/CLAUDE.md", "**/AGENTS.md", ".mcp.json", "**/SKILL.md", "**/skills/**",
-              ".claude/**", ".claude-plugin/**", ".cursor/rules/**"))))
+          raw = subprocess.run(["git", "ls-files", "-s", "-z"], check=True, capture_output=True).stdout
+          modes = {}
+          for rec in os.fsdecode(raw).split("\0"):
+              if rec:
+                  meta, path = rec.split("\t", 1)
+                  modes[path] = meta.split()[0]
+
+          def fold(name):
+              # How a macOS disk compares names: case-insensitive and Unicode-normalised, so the composed and
+              # decomposed spellings of an accented name are one file there.
+              return unicodedata.normalize("NFD", name).casefold()
+
+          def parts(p):
+              return [fold(c) for c in p.split("/")]
+
+          def inside(real):
+              return (real == root or real.startswith(root + os.sep)) and \
+                  not (real + os.sep).startswith(os.path.join(root, ".git") + os.sep)
+
+          def agent_facing(p):
+              ps = parts(p)
+              if ps[-1] in AGENT_FILES:
+                  return True
+              # A path inside an agent dir, or the dir entry itself when it is a symlink.
+              if any(c in AGENT_DIRS for c in ps):
+                  return True
+              return any(ps[i] == ".cursor" and ps[i + 1] == "rules" for i in range(len(ps) - 1))
+
+          selected = {p for p in modes if agent_facing(p)}
           # A skill is its whole directory: scripts beside SKILL.md run with it.
-          for skill in [f for f in files if os.path.basename(f) == "SKILL.md"]:
-              d = os.path.dirname(skill)
-              if d:
-                  files.update(ls(":(literal)" + d))
-          files = sorted(f for f in files if "node_modules" not in f.split("/"))
+          for p in list(modes):
+              d = os.path.dirname(p)
+              if parts(p)[-1] == "skill.md" and d:
+                  selected.update(q for q in modes if q.startswith(d + "/"))
 
-          copied, skipped = 0, []
-          for f in files:
-              real = os.path.realpath(f)
-              # A symlink is scanned as its target only when that target is a file inside
-              # the repo; anything else is not copied (it could pull runner files into
-              # the uploaded report) and is listed as not scanned.
-              if not real.startswith(root + os.sep) or not os.path.isfile(real):
-                  skipped.append(f)
+          skipped = []
+          imported = {}  # real path -> repo-relative path it is staged under
+
+          def resolve(base, ref):
+              """Resolves ref against directory base the way a macOS disk would: following links
+              and matching each name case-insensitively. Returns the real path, or None."""
+              cur = base if not os.path.isabs(ref) else "/"
+              for name in [c for c in ref.split("/") if c not in ("", ".")]:
+                  if name == "..":
+                      cur = os.path.dirname(cur)
+                      continue
+                  cand = os.path.join(cur, name)
+                  if not os.path.lexists(cand):
+                      try:
+                          match = [e for e in os.listdir(cur) if fold(e) == fold(name)]
+                      except OSError:
+                          return None
+                      if not match:
+                          return None
+                      cand = os.path.join(cur, match[0])
+                  cur = os.path.realpath(cand)
+              return cur
+
+          # CLAUDE.md-style files pull in other files with `@path` imports, recursively, and those
+          # reach the agent too. Rather than mimic one parser, this over-approximates and fails
+          # closed: every path-like `@token` is resolved under both readings of `..` (textual, and
+          # physical after a link), from every folder the importer can be reached through. Every repo
+          # file any of those reaches is scanned, and is itself read for imports from every path it
+          # was reached by; a path-like token at a word start that reaches nothing, or anything
+          # outside the repo, fails the check. A token right after an unescaped backtick is skipped,
+          # as markdown makes that code. Tokens end only at JavaScript whitespace, which is narrower
+          # than Python's, so no token is cut shorter than a Node-based reader would cut it.
+          JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+          TOKEN = rf"((?:\\ |[^{JS_SPACE}])+)"
+          AT_START = re.compile(rf"(?<![\w@/])(?<!(?<!\\)`)@{TOKEN}")
+          # `@` inside a word (an email, say) is followed when it reaches a repo file, but does not
+          # fail the check when it reaches nothing.
+          IN_WORD = re.compile(rf"(?<=[\w/])@{TOKEN}")
+          TRAIL = ".,:;!?)]}>\"'`"
+
+          def textual(base_rel, ref):
+              t = os.path.normpath(os.path.join(base_rel, ref)) if not os.path.isabs(ref) else ref
+              if os.path.isabs(t) or t == ".." or t.startswith("../"):
+                  return None, "OUTSIDE"
+              return t, resolve(root, t)
+
+          groups = {}
+          for p in modes:
+              groups.setdefault(fold(p), []).append(p)
+          for group in groups.values():
+              if len(group) > 1:
+                  # On a macOS disk only one of these exists, and which one is not knowable here.
+                  skipped.append(" and ".join(sorted(group)) + " name the same file on a Mac")
+
+          staged = set()
+          visited = set()
+          walked_importers = set()
+
+          def stage(src, rel):
+              real = os.path.realpath(src)
+              if not inside(real):
+                  skipped.append(rel)
+              elif modes.get(os.path.relpath(real, root)) == "160000":
+                  # A submodule checks out empty here but is fetched by anyone cloning recursively,
+                  # whether it is listed directly or reached through a link.
+                  skipped.append(f"{rel} (submodule)")
+              elif os.path.isfile(real):
+                  target = os.path.join(dest, rel)
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  shutil.copyfile(real, target)
+                  staged.add(rel)
+                  if fold(os.path.basename(rel)) in IMPORTERS:
+                      # Read for imports at this path too: an agent opening it through a linked
+                      # folder resolves `..` from here, not from where the file really lives.
+                      walked_importers.add(rel)
+              elif os.path.isdir(real):
+                  # Every link below is followed through the same checks, so a link out of the repo
+                  # anywhere under an agent dir is caught; `visited` stops link loops.
+                  if real in visited:
+                      return
+                  visited.add(real)
+                  for name in sorted(os.listdir(real)):
+                      if real == root and name == ".git":
+                          continue
+                      stage(os.path.join(real, name), f"{rel}/{name}")
+              else:
+                  skipped.append(rel)
+
+          for p in sorted(selected):
+              stage(os.path.join(root, p), p)
+
+          # Queue entries are paths as reached: through links and `..` textually, so a file imported
+          # via `link/sub.md` keeps `link/` as a folder its own imports resolve from.
+          # Any tracked link to a folder in the repo (not only an agent dir) gives every CLAUDE.md
+          # under it a second path, which an agent working through the link opens it by; `..` in its
+          # imports then resolves from there. Links through links are followed a few levels deep.
+          link_dirs = {}
+          for lp, mode in modes.items():
+              if mode == "120000":
+                  lr = os.path.realpath(os.path.join(root, lp))
+                  if inside(lr) and os.path.isdir(lr):
+                      link_dirs[lp] = os.path.relpath(lr, root)
+          MAX_ALIASES = 500
+          aliases = set()
+          frontier = {p for p in modes if parts(p)[-1] in IMPORTERS} | walked_importers
+          for _ in range(4):
+              grown = set()
+              for link, target in link_dirs.items():
+                  prefix = "" if target == "." else target + "/"
+                  for q in frontier:
+                      if q.startswith(prefix):
+                          alias = link + "/" + q[len(prefix):]
+                          if alias not in aliases:
+                              grown.add(alias)
+              if not grown:
+                  break
+              aliases |= grown
+              frontier = grown
+              if len(aliases) > MAX_ALIASES:
+                  skipped.append(f"more than {MAX_ALIASES} paths to CLAUDE.md-style files through "
+                                 "links; too many to check the imports from each")
+                  break
+          else:
+              if grown:
+                  # Still growing after the last round: deeper link chains exist that were not
+                  # followed, so their imports are unknown.
+                  skipped.append("CLAUDE.md-style files are reachable through more than 4 chained "
+                                 "folder links; too deep to check the imports from each")
+
+          # Breadth-first, so every path is first read at its shallowest import depth: a file reached
+          # late through a long chain is not then skipped when a short chain reaches it.
+          # Read for imports: every CLAUDE.md-style file at every path it has, and every Markdown file
+          # collected (slash commands, rules, agents and skills take `@file` references too).
+          queue = collections.deque((p, 0) for p in sorted(walked_importers | aliases
+                                                            | {p for p in selected if parts(p)[-1] in IMPORTERS}
+                                                            | {p for p in staged if p.lower().endswith(".md")}))
+          done = set()
+          locations = {}
+          # Bounds the work, so imports chained through many links fail the check quickly and say so
+          # rather than running into the job's time limit.
+          MAX_READS, MAX_LOCATIONS = 2000, 16
+          reads = 0
+          while queue:
+              loc, depth = queue.popleft()
+              if reads >= MAX_READS:
+                  skipped.append(f"more than {MAX_READS} import reads; the import graph is too large to check")
+                  break
+              real = os.path.realpath(os.path.join(root, loc))
+              # Never open a file outside the repo, even to read imports from it.
+              if (loc, real) in done or depth > 5 or not inside(real) or not os.path.isfile(real):
                   continue
-              target = os.path.join(dest, f)
-              os.makedirs(os.path.dirname(target), exist_ok=True)
-              shutil.copyfile(real, target)
-              copied += 1
+              done.add((loc, real))
+              locations.setdefault(real, set()).add(loc)
+              if len(locations[real]) > MAX_LOCATIONS:
+                  skipped.append(f"{os.path.relpath(real, root)} is reachable through more than "
+                                 f"{MAX_LOCATIONS} paths; too many to check its imports from each")
+                  continue
+              reads += 1
+              bases = {os.path.dirname(loc), os.path.relpath(os.path.dirname(real), root)}
+              bases = {"" if b == "." else b for b in bases}
+              # Also the repo root, as slash commands resolve `@file` from the project root rather than
+              # the command file's folder. It only adds files to scan: a `..` that leaves the repo from
+              # the root says nothing about where the file's own folder would take it.
+              # For a slash command the root is the real base, so its out-of-repo results count.
+              ps = parts(loc)
+              is_command = "commands" in ps and any(c in AGENT_DIRS for c in ps)
+              extra_root = "" not in bases and not is_command
+              bases = bases | {""}
+              text = open(real, encoding="utf-8", errors="replace").read()
+              for strict, pattern in ((True, AT_START), (False, IN_WORD)):
+                  for m in pattern.finditer(text):
+                      tok = m.group(1).replace("\\ ", " ")
+                      refs = {tok, tok.rstrip(TRAIL)}
+                      refs |= {r.split("#", 1)[0] for r in list(refs)}
+                      refs = {r for r in refs if r and not r.startswith("~")}
+                      if not refs:
+                          continue
+                      looks_like_path = any("/" in r or "." in os.path.basename(r) for r in refs)
+                      found, outside = [], []
+                      for r in refs:
+                          for b in bases:
+                              tloc, treal = textual(b, r)
+                              preal = resolve(root if not b else os.path.join(root, b), r)
+                              for cand_loc, cand_real in ((tloc, treal), (None, preal)):
+                                  if cand_real is None:
+                                      continue
+                                  if cand_real == "OUTSIDE" or not inside(cand_real):
+                                      if not (b == "" and extra_root):
+                                          outside.append(r)
+                                  else:
+                                      found.append((cand_loc, cand_real))
+                      if outside and strict:
+                          skipped.append(f"{loc} imports @{tok}, outside the repo")
+                      for cand_loc, target in found:
+                          if os.path.isfile(target):
+                              trel = os.path.relpath(target, root)
+                              imported[target] = trel
+                              # Whatever its type, an imported file is read for imports in turn.
+                              queue.append((trel, depth + 1))
+                              if cand_loc and cand_loc != trel:
+                                  queue.append((cand_loc, depth + 1))
+                      if strict and not found and not outside and looks_like_path:
+                          skipped.append(f"{loc} imports @{tok}, which is not a file in the repo")
 
+          for real, rel in sorted(imported.items()):
+              stage(real, rel)
+
+          # The same import reached through several paths (a self-link, say) is reported once.
+          seen_reports = set()
+          unique = []
+          for item in skipped:
+              key = item.split(" imports ", 1)[-1] if " imports " in item else item
+              if key not in seen_reports:
+                  seen_reports.add(key)
+                  unique.append(item)
+          skipped = unique
           with open(skipped_path, "w") as fh:
               fh.writelines(s + "\n" for s in skipped)
           with open(out, "a") as fh:
-              fh.write(f"count={copied}\ndir={dest}\n")
-          print(f"Agent-facing files: {copied} staged, {len(skipped)} not scanned")
+              fh.write(f"count={len(staged)}\nskipped={len(skipped)}\ndir={dest}\n")
+          print(f"Agent-facing files: {len(staged)} staged, {len(skipped)} could not be scanned")
           PY
 
       - name: Nothing to scan
-        if: steps.stage.outputs.count == '0'
+        if: steps.stage.outputs.count == '0' && steps.stage.outputs.skipped == '0'
         run: echo "No agent-facing files in this repo; nothing to scan." >> "$GITHUB_STEP_SUMMARY"
 
       # The scanner is pinned to a reviewed commit and installed from that commit's own
-      # uv.lock, so neither it nor its dependencies move between runs. Bump deliberately.
+      # uv.lock, so neither it nor its dependencies move between runs. Its build backend
+      # (hatchling) is installed first from the same lock with hashes required, and the
+      # build uses it rather than resolving a fresh one. Bump deliberately.
       - name: Check out SkillSpector
         if: steps.stage.outputs.count != '0'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -133,16 +358,44 @@ jobs:
 
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         if: steps.stage.outputs.count != '0'
+        with:
+          # uv itself is pinned like everything else; no cache, so a PR's run never writes
+          # one into the base branch's cache scope.
+          version: "0.13.10"
+          enable-cache: false
 
       - name: Install SkillSpector
         if: steps.stage.outputs.count != '0'
-        run: uv sync --project skillspector --frozen --no-dev --python 3.13
+        run: |
+          python3 -I - skillspector/uv.lock "$RUNNER_TEMP/build-constraints.txt" <<'PY'
+          # Pins the build backend and its dependencies, with hashes, from the scanner's lock.
+          import sys, tomllib
+          lock = tomllib.load(open(sys.argv[1], "rb"))
+          pkgs = {p["name"]: p for p in lock["package"]}
+          todo, seen = ["hatchling"], []
+          while todo:
+              n = todo.pop()
+              if n not in seen:
+                  seen.append(n)
+                  todo += [d["name"] for d in pkgs[n].get("dependencies", [])]
+          with open(sys.argv[2], "w") as fh:
+              for n in sorted(seen):
+                  p = pkgs[n]
+                  hashes = [w["hash"] for w in p.get("wheels", [])]
+                  if "sdist" in p:
+                      hashes.append(p["sdist"]["hash"])
+                  fh.write(f"{n}=={p['version']} " + " ".join(f"--hash={h}" for h in hashes) + "\n")
+          PY
+          uv venv skillspector/.venv --python 3.13.18
+          uv pip install --python skillspector/.venv --require-hashes -r "$RUNNER_TEMP/build-constraints.txt"
+          uv sync --project skillspector --frozen --no-dev --inexact --no-editable \
+            --no-build-isolation-package skillspector
 
       - name: Scan
         if: steps.stage.outputs.count != '0'
         env:
           SCAN_DIR: ${{ steps.stage.outputs.dir }}
-          BASELINE: ${{ github.event_name == 'pull_request' && 'base/.github/skillspector-baseline.json' || 'repo/.github/skillspector-baseline.json' }}
+          BASELINE: ${{ github.event_name == 'pull_request_target' && 'base/.github/skillspector-baseline.json' || 'repo/.github/skillspector-baseline.json' }}
         run: |
           set -uo pipefail
           args=(scan "$SCAN_DIR" --no-llm --format json --output "$RUNNER_TEMP/skillspector.json")
@@ -153,9 +406,9 @@ jobs:
           # still written when the scan fails, which is when it matters most.
           code=0
           uv run --project skillspector --frozen --no-dev --no-sync skillspector "${args[@]}" || code=$?
-          python3 -I - "$RUNNER_TEMP/skillspector.json" "$RUNNER_TEMP/skipped.txt" "$code" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          python3 -I - "$RUNNER_TEMP/skillspector.json" "$code" >> "$GITHUB_STEP_SUMMARY" <<'PY'
           import json, sys
-          path, skipped_path, code = sys.argv[1], sys.argv[2], sys.argv[3]
+          path, code = sys.argv[1], sys.argv[2]
           print("## SkillSpector")
           print()
           try:
@@ -181,13 +434,23 @@ jobs:
                         f"`{loc.get('file')}` | {loc.get('start_line')} | {match} |")
           for x in c.get("ledger_exceptions") or []:
               print(f"\nNot fully inspected: `{x.get('path')}` ({x.get('reason_code')}).")
-          skipped = [s for s in open(skipped_path).read().splitlines() if s]
-          if skipped:
-              print("\nNot scanned (symlink to outside the repo, or not a regular file):")
-              for s in skipped:
-                  print(f"- `{s}`")
           PY
           exit "$code"
+
+      # Runs even when nothing else was scanned, so an agent file that is only a symlink out
+      # of the repo still fails the check instead of passing as "nothing to scan".
+      - name: Fail on files that could not be scanned
+        if: always() && steps.stage.outputs.skipped != '0' && steps.stage.outputs.skipped != ''
+        run: |
+          {
+            echo "## Agent-facing files that could not be scanned"
+            echo
+            echo "An agent reads these, but each is a symlink out of the repo, a dangling link or"
+            echo "not a regular file, so its content is unknown. Replace it with a real file in the repo."
+            echo
+            sed 's/.*/- `&`/' "$RUNNER_TEMP/skipped.txt"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
 
       - name: Upload report
         if: always() && steps.stage.outputs.count != '0'
