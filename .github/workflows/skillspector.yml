@@ -247,8 +247,11 @@ jobs:
 
           # Breadth-first, so every path is first read at its shallowest import depth: a file reached
           # late through a long chain is not then skipped when a short chain reaches it.
+          # Read for imports: every CLAUDE.md-style file at every path it has, and every Markdown file
+          # collected (slash commands, rules, agents and skills take `@file` references too).
           queue = collections.deque((p, 0) for p in sorted(walked_importers | aliases
-                                                            | {p for p in selected if parts(p)[-1] in IMPORTERS}))
+                                                            | {p for p in selected if parts(p)[-1] in IMPORTERS}
+                                                            | {p for p in staged if p.lower().endswith(".md")}))
           done = set()
           locations = {}
           # Bounds the work, so imports chained through many links fail the check quickly and say so
@@ -273,6 +276,11 @@ jobs:
               reads += 1
               bases = {os.path.dirname(loc), os.path.relpath(os.path.dirname(real), root)}
               bases = {"" if b == "." else b for b in bases}
+              # Also the repo root, as slash commands resolve `@file` from the project root rather than
+              # the command file's folder. It only adds files to scan: a `..` that leaves the repo from
+              # the root says nothing about where the file's own folder would take it.
+              extra_root = "" not in bases
+              bases = bases | {""}
               text = open(real, encoding="utf-8", errors="replace").read()
               for strict, pattern in ((True, AT_START), (False, IN_WORD)):
                   for m in pattern.finditer(text):
@@ -292,7 +300,8 @@ jobs:
                                   if cand_real is None:
                                       continue
                                   if cand_real == "OUTSIDE" or not inside(cand_real):
-                                      outside.append(r)
+                                      if not (b == "" and extra_root):
+                                          outside.append(r)
                                   else:
                                       found.append((cand_loc, cand_real))
                       if outside and strict:
@@ -301,10 +310,10 @@ jobs:
                           if os.path.isfile(target):
                               trel = os.path.relpath(target, root)
                               imported[target] = trel
-                              if target.lower().endswith(".md"):
-                                  queue.append((trel, depth + 1))
-                                  if cand_loc and cand_loc != trel:
-                                      queue.append((cand_loc, depth + 1))
+                              # Whatever its type, an imported file is read for imports in turn.
+                              queue.append((trel, depth + 1))
+                              if cand_loc and cand_loc != trel:
+                                  queue.append((cand_loc, depth + 1))
                       if strict and not found and not outside and looks_like_path:
                           skipped.append(f"{loc} imports @{tok}, which is not a file in the repo")
 
