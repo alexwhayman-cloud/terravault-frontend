@@ -170,17 +170,99 @@ jobs:
                   # On a macOS disk only one of these exists, and which one is not knowable here.
                   skipped.append(" and ".join(sorted(group)) + " name the same file on a Mac")
 
+          staged = set()
+          visited = set()
+          walked_importers = set()
+
+          def stage(src, rel):
+              real = os.path.realpath(src)
+              if not inside(real):
+                  skipped.append(rel)
+              elif modes.get(os.path.relpath(real, root)) == "160000":
+                  # A submodule checks out empty here but is fetched by anyone cloning recursively,
+                  # whether it is listed directly or reached through a link.
+                  skipped.append(f"{rel} (submodule)")
+              elif os.path.isfile(real):
+                  target = os.path.join(dest, rel)
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  shutil.copyfile(real, target)
+                  staged.add(rel)
+                  if fold(os.path.basename(rel)) in IMPORTERS:
+                      # Read for imports at this path too: an agent opening it through a linked
+                      # folder resolves `..` from here, not from where the file really lives.
+                      walked_importers.add(rel)
+              elif os.path.isdir(real):
+                  # Every link below is followed through the same checks, so a link out of the repo
+                  # anywhere under an agent dir is caught; `visited` stops link loops.
+                  if real in visited:
+                      return
+                  visited.add(real)
+                  for name in sorted(os.listdir(real)):
+                      if real == root and name == ".git":
+                          continue
+                      stage(os.path.join(real, name), f"{rel}/{name}")
+              else:
+                  skipped.append(rel)
+
+          for p in sorted(selected):
+              stage(os.path.join(root, p), p)
+
           # Queue entries are paths as reached: through links and `..` textually, so a file imported
           # via `link/sub.md` keeps `link/` as a folder its own imports resolve from.
-          queue = [(p, 0) for p in sorted(selected) if parts(p)[-1] in IMPORTERS]
+          # Any tracked link to a folder in the repo (not only an agent dir) gives every CLAUDE.md
+          # under it a second path, which an agent working through the link opens it by; `..` in its
+          # imports then resolves from there. Links through links are followed a few levels deep.
+          link_dirs = {}
+          for lp, mode in modes.items():
+              if mode == "120000":
+                  lr = os.path.realpath(os.path.join(root, lp))
+                  if inside(lr) and os.path.isdir(lr):
+                      link_dirs[lp] = os.path.relpath(lr, root)
+          MAX_ALIASES = 500
+          aliases = set()
+          frontier = {p for p in modes if parts(p)[-1] in IMPORTERS} | walked_importers
+          for _ in range(4):
+              grown = set()
+              for link, target in link_dirs.items():
+                  prefix = "" if target == "." else target + "/"
+                  for q in frontier:
+                      if q.startswith(prefix):
+                          alias = link + "/" + q[len(prefix):]
+                          if alias not in aliases:
+                              grown.add(alias)
+              if not grown:
+                  break
+              aliases |= grown
+              frontier = grown
+              if len(aliases) > MAX_ALIASES:
+                  skipped.append(f"more than {MAX_ALIASES} paths to CLAUDE.md-style files through "
+                                 "links; too many to check the imports from each")
+                  break
+
+          queue = [(p, 0) for p in sorted(walked_importers | aliases
+                                          | {p for p in selected if parts(p)[-1] in IMPORTERS})]
           done = set()
+          locations = {}
+          # Bounds the work, so imports chained through many links fail the check quickly and say so
+          # rather than running into the job's time limit.
+          MAX_READS, MAX_LOCATIONS = 2000, 16
+          reads = 0
           while queue:
               loc, depth = queue.pop()
+              if reads >= MAX_READS:
+                  skipped.append(f"more than {MAX_READS} import reads; the import graph is too large to check")
+                  break
               real = os.path.realpath(os.path.join(root, loc))
               # Never open a file outside the repo, even to read imports from it.
               if (loc, real) in done or depth > 5 or not inside(real) or not os.path.isfile(real):
                   continue
               done.add((loc, real))
+              locations.setdefault(real, set()).add(loc)
+              if len(locations[real]) > MAX_LOCATIONS:
+                  skipped.append(f"{os.path.relpath(real, root)} is reachable through more than "
+                                 f"{MAX_LOCATIONS} paths; too many to check its imports from each")
+                  continue
+              reads += 1
               bases = {os.path.dirname(loc), os.path.relpath(os.path.dirname(real), root)}
               bases = {"" if b == "." else b for b in bases}
               text = open(real, encoding="utf-8", errors="replace").read()
@@ -218,37 +300,6 @@ jobs:
                       if strict and not found and not outside and looks_like_path:
                           skipped.append(f"{loc} imports @{tok}, which is not a file in the repo")
 
-          staged = set()
-          visited = set()
-
-          def stage(src, rel):
-              real = os.path.realpath(src)
-              if not inside(real):
-                  skipped.append(rel)
-              elif modes.get(os.path.relpath(real, root)) == "160000":
-                  # A submodule checks out empty here but is fetched by anyone cloning recursively,
-                  # whether it is listed directly or reached through a link.
-                  skipped.append(f"{rel} (submodule)")
-              elif os.path.isfile(real):
-                  target = os.path.join(dest, rel)
-                  os.makedirs(os.path.dirname(target), exist_ok=True)
-                  shutil.copyfile(real, target)
-                  staged.add(rel)
-              elif os.path.isdir(real):
-                  # Every link below is followed through the same checks, so a link out of the repo
-                  # anywhere under an agent dir is caught; `visited` stops link loops.
-                  if real in visited:
-                      return
-                  visited.add(real)
-                  for name in sorted(os.listdir(real)):
-                      if real == root and name == ".git":
-                          continue
-                      stage(os.path.join(real, name), f"{rel}/{name}")
-              else:
-                  skipped.append(rel)
-
-          for p in sorted(selected):
-              stage(os.path.join(root, p), p)
           for real, rel in sorted(imported.items()):
               stage(real, rel)
 
