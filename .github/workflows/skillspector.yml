@@ -71,7 +71,7 @@ jobs:
           # at its repo-relative path. Works from the full tracked-file list (NUL-separated, with
           # modes), so no file name can break it and nothing is matched by a pattern a PR can dodge.
           # Nothing that resolves outside the repo is ever opened.
-          import os, re, shutil, subprocess, sys
+          import os, re, shutil, subprocess, sys, unicodedata
           dest, out, skipped_path = sys.argv[1:4]
           root = os.path.realpath(".")
 
@@ -88,8 +88,13 @@ jobs:
                   meta, path = rec.split("\t", 1)
                   modes[path] = meta.split()[0]
 
+          def fold(name):
+              # How a macOS disk compares names: case-insensitive and Unicode-normalised, so the composed and
+              # decomposed spellings of an accented name are one file there.
+              return unicodedata.normalize("NFD", name).casefold()
+
           def parts(p):
-              return [c.lower() for c in p.split("/")]
+              return [fold(c) for c in p.split("/")]
 
           def inside(real):
               return (real == root or real.startswith(root + os.sep)) and \
@@ -125,7 +130,7 @@ jobs:
                   cand = os.path.join(cur, name)
                   if not os.path.lexists(cand):
                       try:
-                          match = [e for e in os.listdir(cur) if e.lower() == name.lower()]
+                          match = [e for e in os.listdir(cur) if fold(e) == fold(name)]
                       except OSError:
                           return None
                       if not match:
@@ -137,68 +142,81 @@ jobs:
           # CLAUDE.md-style files pull in other files with `@path` imports, recursively, and those
           # reach the agent too. Rather than mimic one parser, this over-approximates and fails
           # closed: every path-like `@token` is resolved under both readings of `..` (textual, and
-          # physical after a link), from both the importer's own folder and, when the importer is a
-          # link, its target's folder. Every repo file any of those reaches is scanned; a path-like
-          # token that resolves to nothing, or to anything outside the repo, fails the check. Only a
-          # token right after an unescaped backtick is skipped, as markdown makes that code.
-          IMPORT = re.compile(r"(?<![\w@/])(?<!(?<!\\)`)@((?:\\ |\S)+)")
+          # physical after a link), from every folder the importer can be reached through. Every repo
+          # file any of those reaches is scanned, and is itself read for imports from every path it
+          # was reached by; a path-like token at a word start that reaches nothing, or anything
+          # outside the repo, fails the check. A token right after an unescaped backtick is skipped,
+          # as markdown makes that code. Tokens end only at JavaScript whitespace, which is narrower
+          # than Python's, so no token is cut shorter than a Node-based reader would cut it.
+          JS_SPACE = "\t\n\v\f\r \u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
+          TOKEN = rf"((?:\\ |[^{JS_SPACE}])+)"
+          AT_START = re.compile(rf"(?<![\w@/])(?<!(?<!\\)`)@{TOKEN}")
+          # `@` inside a word (an email, say) is followed when it reaches a repo file, but does not
+          # fail the check when it reaches nothing.
+          IN_WORD = re.compile(rf"(?<=[\w/])@{TOKEN}")
           TRAIL = ".,:;!?)]}>\"'`"
 
           def textual(base_rel, ref):
               t = os.path.normpath(os.path.join(base_rel, ref)) if not os.path.isabs(ref) else ref
               if os.path.isabs(t) or t == ".." or t.startswith("../"):
-                  return "OUTSIDE"
-              return resolve(root, t)
+                  return None, "OUTSIDE"
+              return t, resolve(root, t)
 
-          lowered = {}
+          groups = {}
           for p in modes:
-              lowered.setdefault(p.lower(), []).append(p)
-          for group in lowered.values():
+              groups.setdefault(fold(p), []).append(p)
+          for group in groups.values():
               if len(group) > 1:
-                  # On a case-insensitive disk only one of these exists, and which one is not
-                  # knowable from here.
-                  skipped.append(" and ".join(sorted(group)) + " differ only in case")
+                  # On a macOS disk only one of these exists, and which one is not knowable here.
+                  skipped.append(" and ".join(sorted(group)) + " name the same file on a Mac")
 
+          # Queue entries are paths as reached: through links and `..` textually, so a file imported
+          # via `link/sub.md` keeps `link/` as a folder its own imports resolve from.
           queue = [(p, 0) for p in sorted(selected) if parts(p)[-1] in IMPORTERS]
           done = set()
           while queue:
-              rel_src, depth = queue.pop()
-              real = os.path.realpath(os.path.join(root, rel_src))
+              loc, depth = queue.pop()
+              real = os.path.realpath(os.path.join(root, loc))
               # Never open a file outside the repo, even to read imports from it.
-              if (rel_src, real) in done or depth > 5 or not inside(real) or not os.path.isfile(real):
+              if (loc, real) in done or depth > 5 or not inside(real) or not os.path.isfile(real):
                   continue
-              done.add((rel_src, real))
-              bases = {os.path.dirname(rel_src), os.path.relpath(os.path.dirname(real), root)}
+              done.add((loc, real))
+              bases = {os.path.dirname(loc), os.path.relpath(os.path.dirname(real), root)}
+              bases = {"" if b == "." else b for b in bases}
               text = open(real, encoding="utf-8", errors="replace").read()
-              for m in IMPORT.finditer(text):
-                  tok = m.group(1).replace("\\ ", " ")
-                  refs = {tok, tok.rstrip(TRAIL)}
-                  refs |= {r.split("#", 1)[0] for r in list(refs)}
-                  refs = {r for r in refs if r and not r.startswith("~")}
-                  if not refs:
-                      continue
-                  looks_like_path = any("/" in r or "." in os.path.basename(r) for r in refs)
-                  found, outside = [], []
-                  for r in refs:
-                      for b in bases:
-                          b_abs = root if b in ("", ".") else os.path.join(root, b)
-                          for target in (textual("" if b == "." else b, r), resolve(b_abs, r)):
-                              if target is None:
-                                  continue
-                              if target == "OUTSIDE" or not inside(target):
-                                  outside.append(r)
-                              else:
-                                  found.append(target)
-                  if outside:
-                      skipped.append(f"{rel_src} imports @{tok}, outside the repo")
-                  for target in found:
-                      if os.path.isfile(target):
-                          trel = os.path.relpath(target, root)
-                          imported[target] = trel
-                          if target.lower().endswith(".md"):
-                              queue.append((trel, depth + 1))
-                  if not found and not outside and looks_like_path:
-                      skipped.append(f"{rel_src} imports @{tok}, which is not a file in the repo")
+              for strict, pattern in ((True, AT_START), (False, IN_WORD)):
+                  for m in pattern.finditer(text):
+                      tok = m.group(1).replace("\\ ", " ")
+                      refs = {tok, tok.rstrip(TRAIL)}
+                      refs |= {r.split("#", 1)[0] for r in list(refs)}
+                      refs = {r for r in refs if r and not r.startswith("~")}
+                      if not refs:
+                          continue
+                      looks_like_path = any("/" in r or "." in os.path.basename(r) for r in refs)
+                      found, outside = [], []
+                      for r in refs:
+                          for b in bases:
+                              tloc, treal = textual(b, r)
+                              preal = resolve(root if not b else os.path.join(root, b), r)
+                              for cand_loc, cand_real in ((tloc, treal), (None, preal)):
+                                  if cand_real is None:
+                                      continue
+                                  if cand_real == "OUTSIDE" or not inside(cand_real):
+                                      outside.append(r)
+                                  else:
+                                      found.append((cand_loc, cand_real))
+                      if outside and strict:
+                          skipped.append(f"{loc} imports @{tok}, outside the repo")
+                      for cand_loc, target in found:
+                          if os.path.isfile(target):
+                              trel = os.path.relpath(target, root)
+                              imported[target] = trel
+                              if target.lower().endswith(".md"):
+                                  queue.append((trel, depth + 1))
+                                  if cand_loc and cand_loc != trel:
+                                      queue.append((cand_loc, depth + 1))
+                      if strict and not found and not outside and looks_like_path:
+                          skipped.append(f"{loc} imports @{tok}, which is not a file in the repo")
 
           staged = set()
           visited = set()
@@ -234,6 +252,15 @@ jobs:
           for real, rel in sorted(imported.items()):
               stage(real, rel)
 
+          # The same import reached through several paths (a self-link, say) is reported once.
+          seen_reports = set()
+          unique = []
+          for item in skipped:
+              key = item.split(" imports ", 1)[-1] if " imports " in item else item
+              if key not in seen_reports:
+                  seen_reports.add(key)
+                  unique.append(item)
+          skipped = unique
           with open(skipped_path, "w") as fh:
               fh.writelines(s + "\n" for s in skipped)
           with open(out, "a") as fh:
